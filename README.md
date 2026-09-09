@@ -2,18 +2,19 @@
 
 [![CI](https://github.com/omssky/rw-chebur-monitor/actions/workflows/build.yml/badge.svg)](https://github.com/omssky/rw-chebur-monitor/actions/workflows/build.yml)
 
-Небольшой сервис на Go для мониторинга ТСПУ-блокировок VPN-нод из [Remnawave](https://docs.rw/) через [Cheburcheck](https://cheburcheck.ru/).
+Automatic TSPU block monitoring for [Remnawave](https://docs.rw/). Checks node endpoints through [Cheburcheck](https://cheburcheck.ru/) and sends block and recovery alerts to your Telegram topic.
 
-## Возможности
+## Features
 
-- Автоматическое обновление списка адресов из Remnawave.
-- Динамические проверки на ТСПУ-блокировки — по умолчанию раз в 30 минут.
-- Уведомления о блокировке и восстановлении в выбранный топик Telegram.
-- Сохранение состояния в SQLite между перезапусками.
+- **Automatic discovery** — keeps monitored endpoints in sync with Remnawave.
+- **Dynamic checks** — runs Cheburcheck probes on a configurable schedule, every 30 minutes by default.
+- **Confirmed alerts** — verifies blocks before notifying you and reports when access is restored.
+- **Telegram topics** — delivers alerts to the group and topic you choose.
+- **Persistent state** — preserves incidents and pending notifications across restarts.
 
-## Быстрый запуск
+## Quick start
 
-Нужны Docker с Compose и Telegram-бот с доступом к нужному топику.
+You need Docker with Compose, a Remnawave API token, and a Telegram bot that can post to your topic.
 
 ```bash
 git clone https://github.com/omssky/rw-chebur-monitor.git
@@ -21,13 +22,15 @@ cd rw-chebur-monitor
 cp .env.example .env
 ```
 
-Заполните в `.env` адрес панели, API-токен Remnawave, токен Telegram-бота, ID группы и ID топика.
+Edit `.env` with your Remnawave URL and API token, Telegram bot token, chat ID, and topic ID. Available settings are listed in [.env.example](.env.example).
 
 ```bash
 docker compose up -d
 ```
 
-## Обновление
+Compose uses the published image from `ghcr.io/omssky/rw-chebur-monitor`, available for `linux/amd64` and `linux/arm64`.
+
+## Updating
 
 ```bash
 git pull --ff-only
