@@ -1,11 +1,11 @@
 package config
 
 import (
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/caarlos0/env/v11"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEnvironmentAndDefaults(t *testing.T) {
@@ -13,20 +13,12 @@ func TestEnvironmentAndDefaults(t *testing.T) {
 		"REMNAWAVE_URL": "https://panel.example.com", "REMNAWAVE_API_TOKEN": "panel-secret",
 		"TELEGRAM_BOT_TOKEN": "123:fake", "TELEGRAM_CHAT_ID": "-100123", "TELEGRAM_THREAD_ID": "42",
 	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if c.CheckInterval != 30*time.Minute || c.ConfirmDelay != 3*time.Minute {
-		t.Fatal("wrong defaults")
-	}
-	if text := c.Redact("POST /bot123:fake/sendMessage: panel-secret"); strings.Contains(text, "123:fake") || strings.Contains(text, "panel-secret") {
-		t.Fatal("secret leaked")
-	}
+	require.NoError(t, err)
+	require.NoError(t, c.Validate())
+	require.Equal(t, 30*time.Minute, c.CheckInterval)
+	require.Equal(t, 3*time.Minute, c.ConfirmDelay)
+	require.Equal(t, "POST /bot[redacted]/sendMessage: [redacted]", c.Redact("POST /bot123:fake/sendMessage: panel-secret"))
+
 	c.RemnawaveURL += "/api"
-	if err := c.Validate(); err == nil {
-		t.Fatal("ambiguous API prefix allowed")
-	}
+	require.Error(t, c.Validate(), "ambiguous API prefix must be rejected")
 }

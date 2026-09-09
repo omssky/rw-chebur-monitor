@@ -19,19 +19,17 @@ import (
 type Client struct {
 	baseURL string
 	http    *http.Client
-	timeout time.Duration
 }
 
 func New(baseURL string, client *http.Client) *Client {
-	return &Client{baseURL: baseURL, http: client, timeout: 3 * time.Minute}
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: client}
 }
 
 func (c *Client) Check(ctx context.Context, target string) (monitor.Report, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	report := monitor.Report{Target: target}
-	base := strings.TrimRight(c.baseURL, "/")
-	res, err := c.get(ctx, base+"/api/v1/check?target="+url.QueryEscape(target), "application/json")
+	res, err := c.get(ctx, c.baseURL+"/api/v1/check?target="+url.QueryEscape(target), "application/json")
 	if err != nil {
 		return report, err
 	}
@@ -47,7 +45,7 @@ func (c *Client) Check(ctx context.Context, target string) (monitor.Report, erro
 		return report, fmt.Errorf("Cheburcheck returned no check id")
 	}
 	report.JobID = check.ID
-	res, err = c.get(ctx, base+"/api/v1/probe/"+url.PathEscape(check.ID), "text/event-stream")
+	res, err = c.get(ctx, c.baseURL+"/api/v1/probe/"+url.PathEscape(check.ID), "text/event-stream")
 	if err != nil {
 		return report, err
 	}

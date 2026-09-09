@@ -123,6 +123,9 @@ func (s *Service) poll(ctx context.Context, state *State) error {
 		if err == nil && (!report.Done || report.JobID == "") {
 			err = errors.New("incomplete check")
 		}
+		if err == nil && report.JobID == target.LastJob {
+			err = errors.New("repeated check job")
+		}
 		if err != nil {
 			target.failed(s.Policy, now)
 			var limit *RateLimitError

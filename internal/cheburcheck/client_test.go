@@ -2,18 +2,30 @@ package cheburcheck
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"github.com/omssky/rw-chebur-monitor/internal/monitor"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/omssky/rw-chebur-monitor/internal/monitor"
+	"github.com/stretchr/testify/require"
 )
 
 func sseFixture(verdict string) string {
-	return fmt.Sprintf("event: started\ndata: {\"id\":\"job\",\"target\":\"node.example.com\",\"online_probes\":2}\n\n: ping\n\nevent: result\ndata: {\"job_id\":\"job\",\"probe_id\":\"1\",\"asn\":\"AS123\",\"verdicts\":[%q]}\n\nevent: done\ndata: {\"id\":\"job\",\"online_probes\":2,\"response_count\":1}\n\n", verdict)
+	return fmt.Sprintf(`event: started
+data: {"id":"job","target":"node.example.com","online_probes":2}
+
+: ping
+
+event: result
+data: {"job_id":"job","probe_id":"1","asn":"AS123","verdicts":[%q]}
+
+event: done
+data: {"id":"job","online_probes":2,"response_count":1}
+
+`, verdict)
 }
 
 func TestCheburcheckHTTPAndSSE(t *testing.T) {
@@ -34,61 +46,62 @@ func TestCheburcheckHTTPAndSSE(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	c := Client{server.URL, testHTTPClient(0), time.Second}
-	r, err := c.Check(context.Background(), "node.example.com")
-	if err != nil || !r.Done || len(r.Probes) != 1 || r.Probes[0].Verdicts[0] != "ok" {
-		t.Fatalf("%+v %v", r, err)
-	}
-	if len(requests) != 2 {
-		t.Fatal(requests)
-	}
+
+	client := New(server.URL, server.Client())
+	report, err := client.Check(t.Context(), "node.example.com")
+	require.NoError(t, err)
+	require.True(t, report.Done)
+	require.Len(t, report.Probes, 1)
+	require.Equal(t, []string{"ok"}, report.Probes[0].Verdicts)
+	require.Equal(t, []string{"/api/v1/check", "/api/v1/probe/job"}, requests)
 }
 
 func TestSSERejectsTruncationAndWrongJob(t *testing.T) {
-	for _, body := range []string{
-		strings.Split(sseFixture("ok"), "event: done")[0],
-		strings.Replace(sseFixture("ok"), `"job_id":"job"`, `"job_id":"other"`, 1),
-		strings.Replace(sseFixture("ok"), `"response_count":1`, `"response_count":9`, 1),
+	for name, body := range map[string]string{
+		"truncated":   strings.Split(sseFixture("ok"), "event: done")[0],
+		"wrong job":   strings.Replace(sseFixture("ok"), `"job_id":"job"`, `"job_id":"other"`, 1),
+		"wrong count": strings.Replace(sseFixture("ok"), `"response_count":1`, `"response_count":9`, 1),
 	} {
-		if _, err := readReport(strings.NewReader(body), monitor.Report{JobID: "job", Target: "node.example.com"}); err == nil {
-			t.Fatal("invalid stream accepted")
-		}
+		t.Run(name, func(t *testing.T) {
+			_, err := readReport(strings.NewReader(body), monitor.Report{JobID: "job", Target: "node.example.com"})
+			require.Error(t, err)
+		})
 	}
 }
 
 func TestRateLimitAndNoAutomaticRetry(t *testing.T) {
 	calls := 0
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Retry-After", "90")
-		w.WriteHeader(429)
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
-	defer s.Close()
-	c := Client{s.URL, testHTTPClient(0), time.Second}
-	_, err := c.Check(context.Background(), "node.example.com")
+	defer server.Close()
+
+	client := New(server.URL, server.Client())
+	_, err := client.Check(t.Context(), "node.example.com")
 	var rate *monitor.RateLimitError
-	if !errors.As(err, &rate) || rate.After != 90*time.Second || calls != 1 {
-		t.Fatalf("%v calls=%d", err, calls)
-	}
+	require.ErrorAs(t, err, &rate)
+	require.Equal(t, 90*time.Second, rate.After)
+	require.Equal(t, 1, calls)
 }
 
 func TestSSEDeadline(t *testing.T) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/check" {
 			fmt.Fprint(w, `{"id":"job"}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	}))
-	defer s.Close()
-	c := Client{s.URL, testHTTPClient(0), 50 * time.Millisecond}
-	_, err := c.Check(context.Background(), "node.example.com")
-	if err == nil {
-		t.Fatal("expected deadline")
-	}
-}
+	defer server.Close()
 
-func testHTTPClient(timeout time.Duration) *http.Client { return &http.Client{Timeout: timeout} }
+	client := New(server.URL, server.Client())
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err := client.Check(ctx, "node.example.com")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}

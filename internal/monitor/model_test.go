@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 var testPolicy = Policy{Interval: 30 * time.Minute, ConfirmDelay: 3 * time.Minute}
@@ -21,44 +23,35 @@ func TestConfirmationRestartAndRecovery(t *testing.T) {
 		now = now.Add(3 * time.Minute)
 		return target.observe(Report{JobID: id, Done: true, Probes: probes}, testPolicy, now)
 	}
-	if got := observe("1", testProbe("a", "tspu_block"), testProbe("b", "ok")); len(got) != 0 {
-		t.Fatal("unconfirmed alert", got)
-	}
-	if !target.NextCheck.Equal(now.Add(testPolicy.ConfirmDelay)) {
-		t.Fatal("confirmation not scheduled")
-	}
-	if got := observe("1", testProbe("a", "tspu_block")); len(got) != 0 {
-		t.Fatal("same job confirmed twice")
-	}
-	if got := observe("2", testProbe("a", "tspu_block"), testProbe("b", "ok")); len(got) != 1 {
-		t.Fatal("minority block not alerted", got)
-	}
+	require.Empty(t, observe("1", testProbe("a", "tspu_block"), testProbe("b", "ok")), "unconfirmed alert")
+	require.Equal(t, now.Add(testPolicy.ConfirmDelay), target.NextCheck, "confirmation not scheduled")
+	require.Len(t, observe("2", testProbe("a", "tspu_block"), testProbe("b", "ok")), 1, "minority block not alerted")
+
 	// Reconstruct the state exactly as after a restart.
 	raw, err := json.Marshal(state)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	state = NewState()
-	if err := json.Unmarshal(raw, state); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, json.Unmarshal(raw, state))
 	target = state.Targets["node.example.com"]
-	if got := observe("3", testProbe("a", "tspu_block")); len(got) != 0 {
-		t.Fatal("restart duplicated alert", got)
-	}
+	require.Empty(t, observe("3", testProbe("a", "tspu_block")), "restart duplicated alert")
 	observe("4", testProbe("a", "ok"))
 	observe("5", testProbe("b", "ok")) // missing affected probe breaks the healthy streak
-	if got := observe("6", testProbe("a", "ok")); len(got) != 0 {
-		t.Fatal("premature recovery", got)
-	}
+	require.Empty(t, observe("6", testProbe("a", "ok")), "premature recovery")
 	observe("7", testProbe("a", "uncertain"))
 	observe("8", testProbe("a", "ok"))
-	if got := observe("9", testProbe("a", "ok")); len(got) != 1 {
-		t.Fatal("missing recovery", got)
-	}
-	if len(target.Incidents) != 0 {
-		t.Fatal("closed incident retained")
-	}
+	require.Len(t, observe("9", testProbe("a", "ok")), 1, "missing recovery")
+	require.Empty(t, target.Incidents, "closed incident retained")
+}
+
+func TestDelayedConfirmation(t *testing.T) {
+	now := time.Now()
+	target := &TargetState{Incidents: make(map[string]*Incident)}
+	probes := []Probe{testProbe("a", "tspu_block")}
+	require.Empty(t, target.observe(Report{JobID: "1", Probes: probes}, testPolicy, now))
+
+	// A busy queue can delay a successful follow-up beyond the regular interval.
+	now = now.Add(testPolicy.Interval + time.Minute)
+	require.Len(t, target.observe(Report{JobID: "2", Probes: probes}, testPolicy, now), 1)
 }
 
 func TestErrorsAndNetworkChangesDoNotHeal(t *testing.T) {
@@ -70,27 +63,19 @@ func TestErrorsAndNetworkChangesDoNotHeal(t *testing.T) {
 	}
 	target.observe(Report{JobID: "3", Probes: []Probe{testProbe("a", "ok")}}, testPolicy, now)
 	target.failed(testPolicy, now)
-	if got := target.observe(Report{JobID: "4", Probes: []Probe{testProbe("a", "ok")}}, testPolicy, now); len(got) != 0 {
-		t.Fatal("error did not break recovery streak")
-	}
+	require.Empty(t, target.observe(Report{JobID: "4", Probes: []Probe{testProbe("a", "ok")}}, testPolicy, now), "error did not break recovery streak")
 	moved := testProbe("a", "ok")
 	moved.ASN = "AS999"
 	for _, id := range []string{"5", "6"} {
-		if got := target.observe(Report{JobID: id, Probes: []Probe{moved}}, testPolicy, now); len(got) != 0 {
-			t.Fatal("new network healed old network")
-		}
+		require.Empty(t, target.observe(Report{JobID: id, Probes: []Probe{moved}}, testPolicy, now), "new network healed old network")
 	}
-	if len(target.Incidents) != 1 {
-		t.Fatal("old incident lost")
-	}
+	require.Len(t, target.Incidents, 1, "old incident lost")
 }
 
 func TestRemovedTargetIsNotRecovery(t *testing.T) {
 	state := NewState()
 	state.sync([]Target{{Address: "node.example.com"}}, time.Now())
 	state.Targets["node.example.com"].Incidents["probe"] = &Incident{Open: true}
-	messages := state.sync(nil, time.Now())
-	if len(messages) != 1 || len(state.Targets) != 0 {
-		t.Fatal(messages, state.Targets)
-	}
+	require.Len(t, state.sync(nil, time.Now()), 1)
+	require.Empty(t, state.Targets)
 }

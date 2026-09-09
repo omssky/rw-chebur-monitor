@@ -48,7 +48,6 @@ type Policy struct {
 type Incident struct {
 	Network   string
 	FirstSeen time.Time
-	LastSeen  time.Time
 	Open      bool
 	BadCount  int
 	GoodCount int
@@ -128,9 +127,6 @@ func (t *TargetState) failed(policy Policy, now time.Time) {
 // observe applies one completed scan. A missing or uncertain probe never heals an incident.
 func (t *TargetState) observe(report Report, policy Policy, now time.Time) []string {
 	t.NextCheck = now.Add(policy.Interval)
-	if report.JobID == t.LastJob {
-		return nil
-	}
 	t.LastJob = report.JobID
 	t.Failures = 0
 	seen := make(map[string]bool, len(report.Probes))
@@ -144,11 +140,6 @@ func (t *TargetState) observe(report Report, policy Policy, now time.Time) []str
 				incident = &Incident{Network: probe.label(), FirstSeen: now}
 				t.Incidents[key] = incident
 			}
-			if !incident.Open && !incident.LastSeen.IsZero() && now.Sub(incident.LastSeen) > policy.Interval {
-				incident.BadCount = 0
-				incident.FirstSeen = now
-			}
-			incident.LastSeen = now
 			incident.GoodCount = 0
 			incident.BadCount++
 			if !incident.Open {

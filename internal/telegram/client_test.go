@@ -1,8 +1,6 @@
 package telegram
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +9,7 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/omssky/rw-chebur-monitor/internal/monitor"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTopicAndRateLimit(t *testing.T) {
@@ -35,16 +34,12 @@ func TestTopicAndRateLimit(t *testing.T) {
 	}))
 	defer server.Close()
 	b, err := bot.New("123:fake", bot.WithSkipGetMe(), bot.WithServerURL(server.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	client := &Client{bot: b, chatID: -100123, threadID: 42}
-	if err := client.Send(context.Background(), "test"); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, client.Send(t.Context(), "test"))
 	limited = true
 	var limit *monitor.RateLimitError
-	if err := client.Send(context.Background(), "test"); !errors.As(err, &limit) || limit.After != 90*time.Second {
-		t.Fatal("retry_after not preserved", err)
-	}
+	err = client.Send(t.Context(), "test")
+	require.ErrorAs(t, err, &limit)
+	require.Equal(t, 90*time.Second, limit.After)
 }
