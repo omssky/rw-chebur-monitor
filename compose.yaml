@@ -1,0 +1,26 @@
+services:
+  monitor:
+    image: ${IMAGE:-ghcr.io/omssky/rw-chebur-monitor:latest}
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - monitor-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 64
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  monitor-data:

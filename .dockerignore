@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.env.*
+*.db
+*.db-*
+*.db.lock
+data
+bin
+coverage.out
