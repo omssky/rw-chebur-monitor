@@ -30,55 +30,36 @@ func render(event monitor.Event) string {
 	}
 
 	if event.Kind == monitor.EventEscalation {
-		return "<h3>🔴 Блокировка распространилась на все проверенные сети</h3><p><b>" + host +
-			"</b> · " + address + "</p><p>Проверено: " + timestamp(card.CheckedAt) +
-			`</p><p><a href="` + link + `">Открыть Cheburcheck</a></p>`
+		return fmt.Sprintf("<p><b>%s</b> — теперь блокировка у всех ответивших сканеров (<b>%d</b>).</p>", host, len(card.Probes))
 	}
 	if event.Kind == monitor.EventSummary {
-		heading := "🟢 Восстановлено"
-		text := "Блокировка больше не подтверждается затронутыми сканерами."
+		heading := "✓ " + host + " — доступ восстановлен"
+		text := ""
 		if card.Stopped {
-			heading = "⚪ Наблюдение прекращено"
-			text = "Цель больше не отслеживается. Восстановление не подтверждено."
+			heading = host + " — наблюдение прекращено"
+			text = "<p>Восстановление не подтверждено.</p>"
 		}
-		return "<h3>" + heading + " · " + host + "</h3><p>" + address + "</p><p>" + text +
-			"</p><p>Период наблюдения: " + timestamp(card.StartedAt) + " — " + timestamp(end) +
-			"</p><p>Длительность: " + duration(end.Sub(card.StartedAt)) + "</p>"
+		return "<p><b>" + heading + "</b></p>" + text +
+			"<p>Период наблюдения: <b>" + duration(end.Sub(card.StartedAt)) + "</b>.</p>"
 	}
 
-	var blocked, healthy, unknown int
+	blocked := 0
 	for _, probe := range card.Probes {
-		switch probeStatus(probe) {
-		case 0:
+		if probeStatus(probe) == 0 {
 			blocked++
-		case 1:
-			unknown++
-		default:
-			healthy++
 		}
 	}
-	unknown += max(0, card.Online-len(card.Probes))
 
 	closed := !card.ClosedAt.IsZero()
-	heading := "🟠 Восстановление не подтверждено"
-	if blocked > 0 {
-		heading = "🔴 ТСПУ-блокировка"
-		if healthy > 0 {
-			heading = "🟠 Частичная ТСПУ-блокировка"
-		} else if blocked == len(card.Probes) {
-			heading = "🔴 ТСПУ у всех ответивших"
-		}
-	}
+	var b strings.Builder
+	heading := "<b>" + host + "</b> · " + address
 	switch {
 	case card.Stopped:
-		heading = "⚪ Наблюдение прекращено"
+		heading = "<b>" + host + " · наблюдение прекращено</b>"
 	case closed:
-		heading = "🟢 Восстановлено"
-	case card.Unavailable:
-		heading = "⚪ Нет свежих данных · ТСПУ-инцидент"
+		heading = "<b>" + host + " · восстановлено</b>"
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "<h3>%s · %s</h3>", heading, host)
+	fmt.Fprintf(&b, "<p>%s</p>", heading)
 	// Strikethrough stays inside each block: wrapping a table or details in <s> is invalid.
 	inline := func(text string) string {
 		if closed {
@@ -87,27 +68,46 @@ func render(event monitor.Event) string {
 		return text
 	}
 	paragraph := func(text string) { fmt.Fprintf(&b, "<p>%s</p>", inline(text)) }
-	paragraph(address)
-	if card.Stopped {
-		paragraph("Цель больше не отслеживается. Восстановление не подтверждено.")
-	} else if card.Unavailable {
-		paragraph("Проверка недоступна. Ниже — данные последней успешной проверки.")
+	if closed {
+		paragraph(address)
 	}
-	paragraph(fmt.Sprintf("Ответили <b>%d из %d</b> сканеров · 🔴 ТСПУ: <b>%d</b> · 🟢 OK: <b>%d</b> · ⚪ Неопределённо: <b>%d</b>",
-		len(card.Probes), card.Online, blocked, healthy, unknown))
-	paragraph("Первое обнаружение: " + timestamp(card.StartedAt))
-	paragraph("Период наблюдения: " + duration(end.Sub(card.StartedAt)))
+	switch {
+	case card.Stopped:
+		paragraph("Восстановление не подтверждено.")
+	case closed:
+		// The closed card keeps the incident's history in the details below.
+	case card.Unavailable:
+		paragraph("🔎 Нет свежих данных · ниже последние результаты")
+	default:
+		status := "🔎 Восстановление не подтверждено"
+		if blocked > 0 {
+			label := "сканеров"
+			if card.Online > len(card.Probes) {
+				label = "ответивших сканеров"
+			}
+			status = fmt.Sprintf("🔎 Блокировка у <b>%d из %d</b> %s", blocked, len(card.Probes), label)
+		}
+		paragraph(status)
+		if missing := card.Online - len(card.Probes); missing > 0 {
+			paragraph(fmt.Sprintf("Нет ответа: <b>%d</b>", missing))
+		}
+	}
+	period := "🕒 Наблюдаем "
+	if closed {
+		period = "Период наблюдения: "
+	}
+	paragraph(period + "<b>" + duration(end.Sub(card.StartedAt)) + "</b> · с " + timestamp(card.StartedAt))
 	checked := "Проверено: "
 	if card.Unavailable || card.Stopped {
 		checked = "Последняя успешная проверка: "
 	}
 	paragraph(checked + timestamp(card.CheckedAt))
 	if closed {
-		paragraph("Наблюдение завершено: " + timestamp(card.ClosedAt))
+		paragraph("Завершено: " + timestamp(card.ClosedAt))
 	}
 
 	probes := append([]monitor.Probe(nil), card.Probes...)
-	detailsTitle := "Результаты по сетям"
+	detailsTitle := "Сети и регионы"
 	if closed {
 		probes = card.Affected
 		detailsTitle = "Сети, затронутые за время инцидента"
@@ -127,10 +127,21 @@ func render(event monitor.Event) string {
 			inline(detailsTitle), inline("Сеть"), inline("Регион"), inline("Сканеры"))
 		// Keep below Telegram's block and text limits even as the probe network grows.
 		for _, row := range rows[:min(len(rows), 80)] {
-			status := fmt.Sprintf("🔴 %d · 🟢 %d · ⚪ %d", row.blocked, row.healthy, row.unknown)
-			if row.missing > 0 {
-				status += fmt.Sprintf(" · Нет свежих данных: %d", row.missing)
+			var statuses []string
+			for _, item := range []struct {
+				label string
+				count int
+			}{
+				{"блокировка", row.blocked},
+				{"доступен", row.healthy},
+				{"неопределённо", row.unknown - row.missing},
+				{"нет ответа", row.missing},
+			} {
+				if item.count > 0 {
+					statuses = append(statuses, fmt.Sprintf("%s: %d", item.label, item.count))
+				}
 			}
+			status := strings.Join(statuses, " · ")
 			if closed {
 				status = fmt.Sprintf("Блокировалось: %d", row.blocked+row.healthy+row.unknown)
 			}
@@ -143,7 +154,7 @@ func render(event monitor.Event) string {
 		}
 		b.WriteString("</details>")
 	}
-	paragraph(`<a href="` + link + `">Открыть Cheburcheck</a>`)
+	paragraph(`<a href="` + link + `">Cheburcheck</a>`)
 	return b.String()
 }
 
@@ -230,7 +241,7 @@ func timestamp(at time.Time) string {
 	if at.IsZero() {
 		return "нет данных"
 	}
-	return at.In(moscow).Format("02.01.2006 15:04 МСК")
+	return at.In(moscow).Format("02.01, 15:04 МСК")
 }
 
 func duration(d time.Duration) string {
@@ -242,7 +253,13 @@ func duration(d time.Duration) string {
 		return fmt.Sprintf("%d мин", minutes)
 	}
 	if minutes < 24*60 {
+		if minutes%60 == 0 {
+			return fmt.Sprintf("%d ч", minutes/60)
+		}
 		return fmt.Sprintf("%d ч %d мин", minutes/60, minutes%60)
 	}
-	return fmt.Sprintf("%d д %d ч %d мин", minutes/(24*60), minutes/60%24, minutes%60)
+	if minutes/60%24 == 0 {
+		return fmt.Sprintf("%d д", minutes/(24*60))
+	}
+	return fmt.Sprintf("%d д %d ч", minutes/(24*60), minutes/60%24)
 }

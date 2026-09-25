@@ -72,7 +72,7 @@ func TestSendMethodsAndTopic(t *testing.T) {
 			}
 			var rich models.InputRichMessage
 			require.NoError(t, json.Unmarshal([]byte(request.form.Get("rich_message")), &rich))
-			require.Contains(t, rich.HTML, "<h3>")
+			require.Equal(t, render(*tc.notification.Event), rich.HTML)
 			require.True(t, rich.SkipEntityDetection)
 			if tc.notification.Event.Kind != monitor.EventCard {
 				var reply models.ReplyParameters
