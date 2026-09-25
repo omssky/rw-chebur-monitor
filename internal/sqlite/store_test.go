@@ -1,92 +1,198 @@
 package sqlite
 
 import (
+	"database/sql"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
-	"unicode/utf16"
 
 	"github.com/omssky/rw-chebur-monitor/internal/monitor"
 	"github.com/stretchr/testify/require"
 )
 
-func TestRestartAndOrderedDelivery(t *testing.T) {
+func TestMigrateLegacyOutbox(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "monitor.db")
-	store, err := Open(path)
+	db, err := sql.Open("sqlite", path)
 	require.NoError(t, err)
-	defer store.Close()
-
+	defer db.Close()
+	_, err = db.Exec(`
+CREATE TABLE state (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
+CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, due INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+INSERT INTO state(id,body) VALUES(1,'{"Targets":{}}');
+PRAGMA user_version=1;`)
+	require.NoError(t, err)
 	now := time.Now()
+	due := now.Add(time.Minute)
+	_, err = db.Exec("INSERT INTO outbox(body,due,attempts) VALUES(?,?,?)", "legacy alert", due.Unix(), 3)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store := openStore(t, path)
+	var version int
+	require.NoError(t, store.db.QueryRow("PRAGMA user_version").Scan(&version))
+	require.Equal(t, 2, version)
+	state, err := store.Load(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, state.Targets)
+	next, err := store.NextNotification(ctx, now)
+	require.NoError(t, err)
+	require.Nil(t, next, "migration changed the retry delay")
+
+	next, err = store.NextNotification(ctx, due)
+	require.NoError(t, err)
+	require.NotNil(t, next)
+	require.Equal(t, "legacy alert", next.Body)
+	require.Equal(t, 3, next.Attempts)
+	require.Nil(t, next.Event)
+	require.NoError(t, store.Sent(ctx, *next, 777))
+	next, err = store.NextNotification(ctx, due)
+	require.NoError(t, err)
+	require.Nil(t, next)
+}
+
+func TestCardReferenceSurvivesRestartAndStateSave(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "monitor.db")
+	store := openStore(t, path)
+	now := time.Now().UTC()
 	state := monitor.NewState()
-	state.Targets["node.example.com"] = &monitor.TargetState{
-		Target:    monitor.Target{Address: "node.example.com"},
-		Incidents: map[string]*monitor.Incident{"probe": {Open: true}},
+	event := monitor.Event{
+		Kind:      monitor.EventCard,
+		EpisodeID: "episode-1",
+		Card: monitor.Card{
+			Target:    monitor.Target{Address: "node.example.com"},
+			StartedAt: now,
+		},
 	}
-	require.NoError(t, store.Save(ctx, state, []string{"opening"}, now))
+	require.NoError(t, store.Save(ctx, state, []monitor.Event{event}, now))
+	first, err := store.NextNotification(ctx, now)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Equal(t, &event, first.Event)
+	require.Zero(t, first.MessageID)
+	require.NoError(t, store.Sent(ctx, *first, 101))
 	require.NoError(t, store.Close())
 
-	store, err = Open(path)
-	require.NoError(t, err)
-	defer store.Close()
+	store = openStore(t, path)
+	// Polling saves its own snapshot and cannot overwrite delivery's card ID.
+	state.NextProbe = now.Add(time.Minute)
+	event.Card.CheckedAt = now.Add(time.Minute)
+	require.NoError(t, store.Save(ctx, state, []monitor.Event{event}, now))
 	loaded, err := store.Load(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, loaded)
-	target := loaded.Targets["node.example.com"]
-	require.NotNil(t, target, "target lost after restart")
-	incident := target.Incidents["probe"]
-	require.NotNil(t, incident, "incident lost after restart")
-	require.True(t, incident.Open)
-
-	first, err := store.NextNotification(ctx, now)
-	require.NoError(t, err)
-	require.NotNil(t, first, "notification lost after restart")
-	require.NoError(t, store.Retry(ctx, first.ID, now.Add(time.Minute)))
-	require.NoError(t, store.Save(ctx, loaded, []string{"recovery"}, now))
-
+	require.Equal(t, state.NextProbe, loaded.NextProbe)
 	next, err := store.NextNotification(ctx, now)
 	require.NoError(t, err)
-	require.Nil(t, next, "recovery overtook opening")
-	require.NoError(t, store.Sent(ctx, first.ID))
+	require.NotNil(t, next)
+	require.Equal(t, 101, next.MessageID)
 
+	require.NoError(t, store.ForgetMessage(ctx, event.EpisodeID))
 	next, err = store.NextNotification(ctx, now)
 	require.NoError(t, err)
 	require.NotNil(t, next)
-	require.Equal(t, "recovery", next.Body)
+	require.Zero(t, next.MessageID, "deleted card must be recreated")
+	require.NoError(t, store.Sent(ctx, *next, 202))
+	require.NoError(t, store.Save(ctx, loaded, []monitor.Event{event}, now))
+	next, err = store.NextNotification(ctx, now)
+	require.NoError(t, err)
+	require.NotNil(t, next)
+	require.Equal(t, 202, next.MessageID)
 }
 
-func TestTransactionRollbackAndExclusiveLock(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "monitor.db")
-	store, err := Open(path)
+func TestOrderedCardAndReplies(t *testing.T) {
+	ctx := t.Context()
+	store := openStore(t, filepath.Join(t.TempDir(), "monitor.db"))
+	now := time.Now().UTC()
+	events := []monitor.Event{
+		{Kind: monitor.EventCard, EpisodeID: "episode-1"},
+		{Kind: monitor.EventEscalation, EpisodeID: "episode-1"},
+		{Kind: monitor.EventCard, EpisodeID: "episode-1", Card: monitor.Card{ClosedAt: now}},
+		{Kind: monitor.EventSummary, EpisodeID: "episode-1"},
+	}
+	require.NoError(t, store.Save(ctx, monitor.NewState(), events, now))
+	for i, event := range events {
+		next, err := store.NextNotification(ctx, now)
+		require.NoError(t, err)
+		require.NotNil(t, next)
+		require.Equal(t, &event, next.Event)
+		if i == 0 {
+			require.Zero(t, next.MessageID)
+			require.NoError(t, store.Retry(ctx, next.ID, now.Add(time.Minute)))
+			blocked, err := store.NextNotification(ctx, now)
+			require.NoError(t, err)
+			require.Nil(t, blocked, "reply overtook the delayed card")
+		} else {
+			require.Equal(t, 101, next.MessageID)
+		}
+		messageID := 101
+		if event.Kind != monitor.EventCard {
+			messageID = 999 // Replies must never replace the card ID.
+		}
+		require.NoError(t, store.Sent(ctx, *next, messageID))
+	}
+	var count int
+	require.NoError(t, store.db.QueryRow("SELECT COUNT(*) FROM cards").Scan(&count))
+	require.Zero(t, count, "completed episode retained its card reference")
+	next, err := store.NextNotification(ctx, now)
 	require.NoError(t, err)
-	defer store.Close()
+	require.Nil(t, next)
+}
 
+func TestSaveRollbackAndExclusiveLock(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "monitor.db")
+	store := openStore(t, path)
 	second, err := Open(path)
 	if second != nil {
 		defer second.Close()
 	}
 	require.Error(t, err, "second instance acquired database")
 
-	ctx := t.Context()
 	state := monitor.NewState()
 	require.NoError(t, store.Save(ctx, state, nil, time.Now()))
 	_, err = store.db.Exec(`CREATE TRIGGER reject_notification BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'test failure'); END;`)
 	require.NoError(t, err)
-
 	state.NextProbe = time.Now()
-	require.Error(t, store.Save(ctx, state, []string{"alert"}, time.Now()))
+	event := monitor.Event{Kind: monitor.EventCard, EpisodeID: "episode-1"}
+	require.Error(t, store.Save(ctx, state, []monitor.Event{event}, time.Now()))
 	loaded, err := store.Load(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, loaded)
-	require.True(t, loaded.NextProbe.IsZero(), "state committed without alert")
+	require.True(t, loaded.NextProbe.IsZero(), "state committed without card event")
 }
 
-func TestTelegramMessageLimit(t *testing.T) {
-	message := strings.Repeat("🇫🇮 node ", 600)
-	parts := splitMessage(message)
-	require.Equal(t, message, strings.Join(parts, ""), "message corrupted")
-	for _, part := range parts {
-		require.LessOrEqual(t, len(utf16.Encode([]rune(part))), 3500, "Telegram limit exceeded")
+func TestAcknowledgementIsAtomic(t *testing.T) {
+	ctx := t.Context()
+	store := openStore(t, filepath.Join(t.TempDir(), "monitor.db"))
+	now := time.Now()
+	state := monitor.NewState()
+	for _, kind := range []monitor.EventKind{monitor.EventCard, monitor.EventSummary} {
+		event := monitor.Event{Kind: kind, EpisodeID: "episode-1"}
+		require.NoError(t, store.Save(ctx, state, []monitor.Event{event}, now))
+		next, err := store.NextNotification(ctx, now)
+		require.NoError(t, err)
+		require.NotNil(t, next)
+		_, err = store.db.Exec(`CREATE TRIGGER reject_ack BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT,'test failure'); END;`)
+		require.NoError(t, err)
+		require.Error(t, store.Sent(ctx, *next, 101))
+
+		pending, err := store.NextNotification(ctx, now)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		require.Equal(t, next.ID, pending.ID)
+		require.Equal(t, next.MessageID, pending.MessageID, "reference changed without acknowledging delivery")
+		_, err = store.db.Exec("DROP TRIGGER reject_ack")
+		require.NoError(t, err)
+		require.NoError(t, store.Sent(ctx, *next, 101))
 	}
+}
+
+func openStore(t *testing.T, path string) *Store {
+	t.Helper()
+	store, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	return store
 }

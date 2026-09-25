@@ -8,7 +8,7 @@ Automatic TSPU block monitoring for [Remnawave](https://docs.rw/). Checks node e
 
 - **Automatic discovery** — keeps monitored endpoints in sync with Remnawave.
 - **Dynamic checks** — runs Cheburcheck probes on a configurable schedule, every 30 minutes by default.
-- **Confirmed alerts** — verifies blocks before notifying you and reports when access is restored.
+- **Host incidents** — one live Telegram card per endpoint, with network details and confirmed escalation and recovery alerts.
 - **Telegram topics** — delivers alerts to the group and topic you choose.
 - **Persistent state** — preserves incidents and pending notifications across restarts.
 

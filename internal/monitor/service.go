@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
-	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -22,23 +20,31 @@ type Checker interface {
 }
 
 type Sender interface {
-	Send(context.Context, string) error
+	Send(context.Context, Notification) (int, error)
 }
 
 type Repository interface {
 	Load(context.Context) (*State, error)
-	Save(context.Context, *State, []string, time.Time) error
+	Save(context.Context, *State, []Event, time.Time) error
 	NextNotification(context.Context, time.Time) (*Notification, error)
-	Sent(context.Context, int64) error
+	Sent(context.Context, Notification, int) error
+	ForgetMessage(context.Context, string) error
 	Retry(context.Context, int64, time.Time) error
 }
 
 type Notification struct {
-	ID       int64
-	Body     string
-	Due      int64
-	Attempts int
+	ID        int64
+	Body      string
+	Due       int64
+	Attempts  int
+	Event     *Event
+	MessageID int
 }
+
+type MessageMissingError struct{ Err error }
+
+func (e *MessageMissingError) Error() string { return e.Err.Error() }
+func (e *MessageMissingError) Unwrap() error { return e.Err }
 
 type RateLimitError struct{ After time.Duration }
 
@@ -119,7 +125,7 @@ func (s *Service) poll(ctx context.Context, state *State) error {
 			return ctx.Err()
 		}
 		now = time.Now().UTC()
-		var messages []string
+		var messages []Event
 		if err == nil && (!report.Done || report.JobID == "") {
 			err = errors.New("incomplete check")
 		}
@@ -127,7 +133,7 @@ func (s *Service) poll(ctx context.Context, state *State) error {
 			err = errors.New("repeated check job")
 		}
 		if err != nil {
-			target.failed(s.Policy, now)
+			messages = target.failed(s.Policy, now)
 			var limit *RateLimitError
 			if errors.As(err, &limit) {
 				state.NextProbe = now.Add(max(time.Minute, limit.After))
@@ -135,10 +141,8 @@ func (s *Service) poll(ctx context.Context, state *State) error {
 			}
 			s.Log.Warn("Check failed", "target", target.Target.Address, "error", err)
 		} else {
-			for _, change := range target.observe(report, s.Policy, now) {
-				messages = append(messages, fmt.Sprintf("%s\nНоды: %s\nЦель: %s\nhttps://cheburcheck.ru/check?target=%s", change, strings.Join(target.Target.Names, ", "), target.Target.Address, url.QueryEscape(target.Target.Address)))
-			}
-			s.Log.Info("Check completed", "target", target.Target.Address, "probes", len(report.Probes), "online", report.Online, "notifications", len(messages))
+			messages = target.observe(report, s.Policy, now)
+			s.Log.Info("Check completed", "target", target.Target.Address, "probes", len(report.Probes), "online", report.Online, "events", len(messages))
 		}
 		if err := s.Store.Save(ctx, state, messages, now); err != nil {
 			return err
@@ -161,15 +165,26 @@ func (s *Service) deliver(ctx context.Context) error {
 			if notification == nil {
 				continue
 			}
-			err = s.Sender.Send(ctx, notification.Body)
+			messageID, err := s.Sender.Send(ctx, *notification)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if err == nil {
-				if err := s.Store.Sent(ctx, notification.ID); err != nil {
+				if err := s.Store.Sent(ctx, *notification, messageID); err != nil {
 					return err
 				}
 				s.Log.Info("Notification delivered", "id", notification.ID)
+				continue
+			}
+			var missing *MessageMissingError
+			if errors.As(err, &missing) && notification.Event != nil && notification.Event.Kind == EventCard {
+				if err := s.Store.ForgetMessage(ctx, notification.Event.EpisodeID); err != nil {
+					return err
+				}
+				if err := s.Store.Retry(ctx, notification.ID, time.Now()); err != nil {
+					return err
+				}
+				s.Log.Warn("Incident card missing; recreating", "id", notification.ID)
 				continue
 			}
 			delay := min(time.Hour, 5*time.Second*time.Duration(1<<min(notification.Attempts, 10)))
